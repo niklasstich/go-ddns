@@ -64,14 +64,6 @@ func init() {
 
 func main() {
 	log.Info("Starting go-ddns updater...")
-	//run once before going into loop
-	err := updateRecords(context.Background())
-	if err != nil {
-		log.Errorf("Failed to update DNS records: %v", err)
-	} else {
-		log.Infof("Update successful at %v, next update at %v", time.Now().Format(dateTimeFormat),
-			time.Now().Add(updateInterval).Format(dateTimeFormat))
-	}
 	//establish cancelable context and waitgroup to wait for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -92,16 +84,23 @@ func main() {
 func runUpdateLoop(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	defer wg.Done()
+
+	loopFunc := func() {
+		err := updateRecords(ctx)
+		if err != nil {
+			log.Errorf("Failed to update DNS records: %v", err)
+		} else {
+			log.Infof("Update successful at %v, next update at %v", time.Now().Format(dateTimeFormat),
+				time.Now().Add(updateInterval).Format(dateTimeFormat))
+		}
+	}
+
+	//run once before the loop
+	loopFunc()
 	for {
 		select {
 		case <-time.After(updateInterval):
-			err := updateRecords(ctx)
-			if err != nil {
-				log.Errorf("Failed to update DNS records: %v", err)
-			} else {
-				log.Infof("Update successful at %v, next update at %v", time.Now().Format(dateTimeFormat),
-					time.Now().Add(updateInterval).Format(dateTimeFormat))
-			}
+			loopFunc()
 		case <-ctx.Done():
 			log.Trace("Stopping update loop")
 			return
@@ -109,6 +108,7 @@ func runUpdateLoop(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
+//updateRecords determines if it is necessary to update the DNS records and does so accordingly
 func updateRecords(ctx context.Context) error {
 	//get current address from godaddy
 	if lastIPAddr == "" {
@@ -122,7 +122,7 @@ func updateRecords(ctx context.Context) error {
 	//TODO: actually update GoDaddy records
 	currIPAddr, err := getPublicIPAddress(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get public Data address: %v", err)
+		return fmt.Errorf("failed to get public IP address: %v", err)
 	}
 	//if ip address is still the same no update is necessary
 	if currIPAddr == lastIPAddr {
@@ -141,6 +141,7 @@ func updateRecords(ctx context.Context) error {
 	return nil
 }
 
+//updateDNSEntriesIP requests to write the correct ipaddr for every DNS entry to GoDaddy
 func updateDNSEntriesIP(ipaddr string, ctx context.Context) error {
 	for _, domain := range domains {
 		//create byte buffer for request body
@@ -175,12 +176,16 @@ func updateDNSEntriesIP(ipaddr string, ctx context.Context) error {
 			return errors.New(fmt.Sprintf("updating dns record for domain %s failed with status code %d: %s",
 				domain, res.StatusCode, string(body)))
 		}
+		err = res.Body.Close()
+		if err != nil {
+			log.Warnf("Failed to close response body, %v", err)
+		}
 	}
 	return nil
 }
 
-//getDNSEntriesIP returns the current Data address in the DNS entries, or "0.0.0.0" if there is
-//more than one domain and the Data addresses aren't equal
+//getDNSEntriesIP returns the current IP address in the DNS entries, or "0.0.0.0" if there is
+//more than one domain and the IP addresses aren't equal
 func getDNSEntriesIP(ctx context.Context) (string, error) {
 	retval := ""
 	//TODO: get current ip addresses for all A entries for all domains
@@ -208,6 +213,11 @@ func getDNSEntriesIP(ctx context.Context) (string, error) {
 			return "0.0.0.0", nil
 		}
 		retval = data[0].Data
+
+		err = resp.Body.Close()
+		if err != nil {
+			log.Warnf("Failed to close response body, %v", err)
+		}
 	}
 	return retval, nil
 }
