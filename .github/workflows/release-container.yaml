@@ -1,8 +1,6 @@
 name: Docker CD
 
-on:
-  release:
-    types: [created]
+on: release
 
 env:
   REGISTRY: ghcr.io
