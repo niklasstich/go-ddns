@@ -1,5 +1,5 @@
 # Build
-FROM golang:latest AS build
+FROM golang:1.19 AS build
 
 WORKDIR /app
 COPY go.mod .
