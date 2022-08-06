@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	log "github.com/sirupsen/logrus"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,12 +21,16 @@ var (
 	apiKey         string
 	apiSecret      string
 	domains        []string
-	lastIPAddr     string
+
+	zeroDialer net.Dialer
+	httpClient = &http.Client{
+		Timeout: 10 * time.Second,
+	}
 )
 
 const dateTimeFormat = "2006-01-02 15:04"
 
-//command line flags
+// command line flags
 func init() {
 	verbose := flag.Bool("v", false, "Turns on verbose output")
 	flag.Parse()
@@ -38,7 +40,16 @@ func init() {
 	}
 }
 
-//get environtment vars
+// set force ipv4
+func init() {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return zeroDialer.DialContext(ctx, "tcp4", addr)
+	}
+	httpClient.Transport = transport
+}
+
+// get environment vars
 func init() {
 	interval := os.Getenv("GD_INTERVAL")
 	var err error
@@ -86,13 +97,20 @@ func runUpdateLoop(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	loopFunc := func() {
-		err := updateRecords(ctx)
+		currIPAddr, err := getPublicIPAddress()
 		if err != nil {
-			log.Errorf("Failed to update DNS records: %v", err)
-		} else {
-			log.Infof("Update successful at %v, next update at %v", time.Now().Format(dateTimeFormat),
-				time.Now().Add(updateInterval).Format(dateTimeFormat))
+			log.Errorf("failed to get public IP address: %v", err)
+			return
 		}
+		for _, domain := range domains {
+			err := checkAndUpdate(ctx, domain, currIPAddr)
+			if err != nil {
+				log.Errorf("Failed to update DNS records: %v", err)
+			} else {
+				log.Infof("Update successful at %v", time.Now().Format(dateTimeFormat))
+			}
+		}
+		log.Infof("Next update at %v", time.Now().Add(updateInterval).Format(dateTimeFormat))
 	}
 
 	//run once before the loop
@@ -108,137 +126,38 @@ func runUpdateLoop(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-//updateRecords determines if it is necessary to update the DNS records and does so accordingly
-func updateRecords(ctx context.Context) error {
+// checkAndUpdate determines if it is necessary to update the DNS records and does so accordingly
+func checkAndUpdate(ctx context.Context, domain string, currentIpAddr string) error {
 	//get current address from godaddy
-	if lastIPAddr == "" {
-		var err error
-		lastIPAddr, err = getDNSEntriesIP(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get current DNS IP address: %v", err)
-		}
-	}
-
-	//TODO: actually update GoDaddy records
-	currIPAddr, err := getPublicIPAddress(ctx)
+	godaddyIPAddr, err := getDomainAtRecordIP(ctx, domain)
 	if err != nil {
-		return fmt.Errorf("failed to get public IP address: %v", err)
+		return fmt.Errorf("failed to get DNS record IP address for domain %s: %v", domain, err)
 	}
-	//if ip address is still the same no update is necessary
-	if currIPAddr == lastIPAddr {
-		log.Debug("Address still the same - no update necessary")
+	if currentIpAddr == godaddyIPAddr {
+		log.Infof("No update necessary for %s", domain)
 		return nil
 	}
-	log.Debugf("oldIP: %s; newIP: %s", lastIPAddr, currIPAddr)
+	log.Debugf("oldIP: %s; newIP: %s", godaddyIPAddr, currentIpAddr)
 
-	err = updateDNSEntriesIP(currIPAddr, ctx)
+	err = setDomainAtRecord(ctx, domain, currentIpAddr)
 	if err != nil {
 		return err
 	}
 
-	lastIPAddr = currIPAddr
-
 	return nil
 }
 
-//updateDNSEntriesIP requests to write the correct ipaddr for every DNS entry to GoDaddy
-func updateDNSEntriesIP(ipaddr string, ctx context.Context) error {
-	for _, domain := range domains {
-		//create byte buffer for request body
-		var buf bytes.Buffer
-		err := json.NewEncoder(&buf).Encode([]struct {
-			Name string `json:"name"`
-			Data string `json:"data"`
-			TTL  int64  `json:"ttl"`
-		}{
-			{
-				"@",
-				ipaddr,
-				int64(updateInterval.Seconds()),
-			},
-		})
-		if err != nil {
-			return err
-		}
-		req, err := http.NewRequestWithContext(ctx, "PUT",
-			fmt.Sprintf("https://api.godaddy.com/v1/domains/%s/records/A", domain), &buf)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", getGDAuthHeader())
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-		if res.StatusCode != 200 {
-			body, _ := ioutil.ReadAll(res.Body)
-			return errors.New(fmt.Sprintf("updating dns record for domain %s failed with status code %d: %s",
-				domain, res.StatusCode, string(body)))
-		}
-		err = res.Body.Close()
-		if err != nil {
-			log.Warnf("Failed to close response body, %v", err)
-		}
-	}
-	return nil
-}
-
-//getDNSEntriesIP returns the current IP address in the DNS entries, or "0.0.0.0" if there is
-//more than one domain and the IP addresses aren't equal
-func getDNSEntriesIP(ctx context.Context) (string, error) {
-	retval := ""
-	//TODO: get current ip addresses for all A entries for all domains
-	for _, domain := range domains {
-		req, err := http.NewRequestWithContext(ctx, "GET",
-			fmt.Sprintf("https://api.godaddy.com/v1/domains/%s/records/A/@", domain), nil)
-		if err != nil {
-			return "", err
-		}
-		//set auth
-		req.Header.Set("Authorization", getGDAuthHeader())
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		//anon struct to extract relevant value from json
-		data := []struct {
-			Data string `json:"data"`
-		}{{}}
-		err = json.NewDecoder(resp.Body).Decode(&data)
-		if err != nil {
-			return "", err
-		}
-		if retval != data[0].Data && retval != "" {
-			return "0.0.0.0", nil
-		}
-		retval = data[0].Data
-
-		err = resp.Body.Close()
-		if err != nil {
-			log.Warnf("Failed to close response body, %v", err)
-		}
-	}
-	return retval, nil
-}
-
-func getGDAuthHeader() string {
-	return fmt.Sprintf("sso-key %s:%s", apiKey, apiSecret)
-}
-
-func getPublicIPAddress(ctx context.Context) (string, error) {
-	req, err := http.NewRequest("GET", "https://api.ipify.org", nil)
+// getPublicIPAddress gets the current public IP address of this device
+func getPublicIPAddress() (string, error) {
+	resp, err := httpClient.Get("http://ifconfig.co")
 	if err != nil {
 		return "", err
 	}
-	req = req.WithContext(ctx)
-	res, err := http.DefaultClient.Do(req)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	ip := string(body)
+	ip = strings.TrimRight(ip, "\n")
+	return ip, nil
 }
